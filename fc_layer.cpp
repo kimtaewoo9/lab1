@@ -12,22 +12,10 @@ typedef struct {
     float* bias;
     float* input;
     float* output;
-    size_t start_batch;
-    size_t end_batch;
+    size_t start_m;
+    size_t end_m;
     int thread_id;
 } ThreadData;
-
-// 효율적인 horizontal sum
-static inline float hsum_ps_sse3(__m256 v) {
-    __m128 vlow  = _mm256_castps256_ps128(v);
-    __m128 vhigh = _mm256_extractf128_ps(v, 1);
-    vlow  = _mm_add_ps(vlow, vhigh);
-    __m128 shuf = _mm_movehdup_ps(vlow);
-    __m128 sums = _mm_add_ps(vlow, shuf);
-    shuf        = _mm_movehl_ps(shuf, sums);
-    sums        = _mm_add_ss(sums, shuf);
-    return _mm_cvtss_f32(sums);
-}
 
 void* fc_layer_thread(void* arg) {
     ThreadData* td = (ThreadData*)arg;
@@ -36,50 +24,97 @@ void* fc_layer_thread(void* arg) {
     const size_t M = td->output_dim;
     
     // 각 배치 처리
-    for (size_t b = td->start_batch; b < td->end_batch; b++) {
+    for (size_t b = 0; b < td->data_cnt; b++) {
         float* input_base = td->input + b * N;
         float* output_base = td->output + b * M;
         
-        // 모든 출력 처리
-        for (size_t m = 0; m < M; m++) {
+        // 이 스레드가 담당하는 출력 범위
+        for (size_t m = td->start_m; m < td->end_m; m++) {
             
-            __m256 sum_vec = _mm256_setzero_ps();
+            // 8개씩 unroll
+            __m256 sum0 = _mm256_setzero_ps();
+            __m256 sum1 = _mm256_setzero_ps();
+            __m256 sum2 = _mm256_setzero_ps();
+            __m256 sum3 = _mm256_setzero_ps();
             
-            // AVX2로 8개씩 처리
             size_t n;
-            for (n = 0; n + 7 < N; n += 8) {
-                // 입력 8개 로드
-                __m256 input_vec = _mm256_loadu_ps(&input_base[n]);
-                
-                // 가중치 8개 gather
-                __m256i vindex = _mm256_setr_epi32(
-                    (n+0) * M + m,
-                    (n+1) * M + m,
-                    (n+2) * M + m,
-                    (n+3) * M + m,
-                    (n+4) * M + m,
-                    (n+5) * M + m,
-                    (n+6) * M + m,
-                    (n+7) * M + m
+            // 32개씩 unroll (4 × 8)
+            for (n = 0; n + 31 < N; n += 32) {
+                // Block 0
+                __m256 in0 = _mm256_loadu_ps(&input_base[n]);
+                __m256 w0 = _mm256_set_ps(
+                    td->matrix[(n+7)*M + m],
+                    td->matrix[(n+6)*M + m],
+                    td->matrix[(n+5)*M + m],
+                    td->matrix[(n+4)*M + m],
+                    td->matrix[(n+3)*M + m],
+                    td->matrix[(n+2)*M + m],
+                    td->matrix[(n+1)*M + m],
+                    td->matrix[(n+0)*M + m]
                 );
-                __m256 weight_vec = _mm256_i32gather_ps(td->matrix, vindex, 4);
+                sum0 = _mm256_fmadd_ps(in0, w0, sum0);
                 
-                // FMA
-                sum_vec = _mm256_fmadd_ps(input_vec, weight_vec, sum_vec);
+                // Block 1
+                __m256 in1 = _mm256_loadu_ps(&input_base[n+8]);
+                __m256 w1 = _mm256_set_ps(
+                    td->matrix[(n+15)*M + m],
+                    td->matrix[(n+14)*M + m],
+                    td->matrix[(n+13)*M + m],
+                    td->matrix[(n+12)*M + m],
+                    td->matrix[(n+11)*M + m],
+                    td->matrix[(n+10)*M + m],
+                    td->matrix[(n+9)*M + m],
+                    td->matrix[(n+8)*M + m]
+                );
+                sum1 = _mm256_fmadd_ps(in1, w1, sum1);
+                
+                // Block 2
+                __m256 in2 = _mm256_loadu_ps(&input_base[n+16]);
+                __m256 w2 = _mm256_set_ps(
+                    td->matrix[(n+23)*M + m],
+                    td->matrix[(n+22)*M + m],
+                    td->matrix[(n+21)*M + m],
+                    td->matrix[(n+20)*M + m],
+                    td->matrix[(n+19)*M + m],
+                    td->matrix[(n+18)*M + m],
+                    td->matrix[(n+17)*M + m],
+                    td->matrix[(n+16)*M + m]
+                );
+                sum2 = _mm256_fmadd_ps(in2, w2, sum2);
+                
+                // Block 3
+                __m256 in3 = _mm256_loadu_ps(&input_base[n+24]);
+                __m256 w3 = _mm256_set_ps(
+                    td->matrix[(n+31)*M + m],
+                    td->matrix[(n+30)*M + m],
+                    td->matrix[(n+29)*M + m],
+                    td->matrix[(n+28)*M + m],
+                    td->matrix[(n+27)*M + m],
+                    td->matrix[(n+26)*M + m],
+                    td->matrix[(n+25)*M + m],
+                    td->matrix[(n+24)*M + m]
+                );
+                sum3 = _mm256_fmadd_ps(in3, w3, sum3);
             }
             
-            // Reduction
-            float sum = hsum_ps_sse3(sum_vec);
+            // 4개 합치기
+            sum0 = _mm256_add_ps(sum0, sum1);
+            sum2 = _mm256_add_ps(sum2, sum3);
+            sum0 = _mm256_add_ps(sum0, sum2);
             
-            // 나머지 스칼라 처리
+            // Horizontal sum
+            float temp[8];
+            _mm256_storeu_ps(temp, sum0);
+            float sum = temp[0] + temp[1] + temp[2] + temp[3] + 
+                       temp[4] + temp[5] + temp[6] + temp[7];
+            
+            // 나머지 처리
             for (; n < N; n++) {
                 sum += input_base[n] * td->matrix[n * M + m];
             }
             
-            // Bias 추가
+            // Bias + ReLU
             sum += td->bias[m];
-            
-            // ReLU
             output_base[m] = (sum > 0.0f) ? sum : 0.0f;
         }
     }
@@ -98,7 +133,7 @@ void fc_layer(
     int threads
 ) {
     if (threads < 1) threads = 1;
-    if ((size_t)threads > data_cnt) threads = data_cnt;
+    if ((size_t)threads > output_dim) threads = output_dim;
     
     if (threads == 1) {
         ThreadData td;
@@ -109,8 +144,8 @@ void fc_layer(
         td.bias = bias;
         td.input = input;
         td.output = output;
-        td.start_batch = 0;
-        td.end_batch = data_cnt;
+        td.start_m = 0;
+        td.end_m = output_dim;
         td.thread_id = 0;
         
         fc_layer_thread(&td);
@@ -120,8 +155,8 @@ void fc_layer(
     pthread_t* thread_handles = (pthread_t*)malloc(threads * sizeof(pthread_t));
     ThreadData* thread_data = (ThreadData*)malloc(threads * sizeof(ThreadData));
     
-    size_t batch_per_thread = data_cnt / threads;
-    size_t remainder = data_cnt % threads;
+    size_t chunk_size = output_dim / threads;
+    size_t remainder = output_dim % threads;
     
     size_t current_start = 0;
     
@@ -133,11 +168,11 @@ void fc_layer(
         thread_data[t].bias = bias;
         thread_data[t].input = input;
         thread_data[t].output = output;
-        thread_data[t].start_batch = current_start;
+        thread_data[t].start_m = current_start;
         thread_data[t].thread_id = t;
         
-        size_t current_chunk = batch_per_thread + (t < (int)remainder ? 1 : 0);
-        thread_data[t].end_batch = current_start + current_chunk;
+        size_t current_chunk = chunk_size + (t < (int)remainder ? 1 : 0);
+        thread_data[t].end_m = current_start + current_chunk;
         current_start += current_chunk;
         
         pthread_create(&thread_handles[t], NULL, fc_layer_thread, &thread_data[t]);
