@@ -1,177 +1,91 @@
-#include <stdio.h>
-#include <immintrin.h>
-#include <pthread.h>
-#include <stdlib.h>
-#include <string.h>
-
-// 캐시 블로킹 타일 크기
-#define TILE_M 64
-#define TILE_N 256
-
-typedef struct {
-    size_t data_cnt;
-    size_t input_dim;
-    size_t output_dim;
-    float* matrix;
-    float* bias;
-    float* input;
-    float* output;
-    size_t start_batch;
-    size_t end_batch;
-    int thread_id;
-} ThreadData;
-
-// 8개 float를 horizontal add로 합산
-static inline float hsum_ps_sse3(__m256 v) {
-    __m128 vlow  = _mm256_castps256_ps128(v);
-    __m128 vhigh = _mm256_extractf128_ps(v, 1);
-    vlow  = _mm_add_ps(vlow, vhigh);
-    __m128 shuf = _mm_movehdup_ps(vlow);
-    __m128 sums = _mm_add_ps(vlow, shuf);
-    shuf        = _mm_movehl_ps(shuf, sums);
-    sums        = _mm_add_ss(sums, shuf);
-    return _mm_cvtss_f32(sums);
-}
-
-void* fc_layer_thread(void* arg) {
-    ThreadData* td = (ThreadData*)arg;
-    
-    const size_t N = td->input_dim;
-    const size_t M = td->output_dim;
-    
-    // 각 배치 처리 (스레드별로 배치 분할)
-    for (size_t b = td->start_batch; b < td->end_batch; b++) {
-        float* input_base = td->input + b * N;
-        float* output_base = td->output + b * M;
-        
-        // 출력 차원에 대해 타일링
-        for (size_t m_tile = 0; m_tile < M; m_tile += TILE_M) {
-            size_t m_end = (m_tile + TILE_M < M) ? m_tile + TILE_M : M;
-            
-            // 입력 차원에 대해 타일링
-            for (size_t n_tile = 0; n_tile < N; n_tile += TILE_N) {
-                size_t n_end = (n_tile + TILE_N < N) ? n_tile + TILE_N : N;
-                
-                // 타일 내부 처리 (출력 차원)
-                for (size_t m = m_tile; m < m_end; m++) {
-                    
-                    // 첫 타일이면 초기화, 아니면 누적
-                    __m256 sum_vec = _mm256_setzero_ps();
-                    
-                    // AVX2 SIMD로 8개씩 처리
-                    size_t n;
-                    for (n = n_tile; n + 7 < n_end; n += 8) {
-                        // 입력 8개 로드 (연속 메모리)
-                        __m256 input_vec = _mm256_loadu_ps(&input_base[n]);
-                        
-                        // 가중치 8개 gather (비연속 메모리)
-                        __m256i vindex = _mm256_setr_epi32(
-                            (n+0) * M + m,
-                            (n+1) * M + m,
-                            (n+2) * M + m,
-                            (n+3) * M + m,
-                            (n+4) * M + m,
-                            (n+5) * M + m,
-                            (n+6) * M + m,
-                            (n+7) * M + m
-                        );
-                        __m256 weight_vec = _mm256_i32gather_ps(td->matrix, vindex, 4);
-                        
-                        // FMA: sum = sum + (input * weight)
-                        sum_vec = _mm256_fmadd_ps(input_vec, weight_vec, sum_vec);
-                    }
-                    
-                    // 8개 부분합 축약
-                    float sum = hsum_ps_sse3(sum_vec);
-                    
-                    // 나머지 스칼라 처리
-                    for (; n < n_end; n++) {
-                        sum += input_base[n] * td->matrix[n * M + m];
-                    }
-                    
-                    // 첫 타일이면 bias 추가 및 출력 저장
-                    if (n_tile == 0) {
-                        sum += td->bias[m];
-                        // ReLU
-                        output_base[m] = (sum > 0.0f) ? sum : 0.0f;
-                    } else {
-                        // 누적
-                        output_base[m] += sum;
-                    }
-                }
-            }
-        }
-    }
-    
-    return NULL;
-}
+/*
+ * fc_layer.cpp
+ * * 이 파일은 Lab 1: Optimized Neural Network Software 과제를 위해
+ * 최적화된 fc_layer 함수를 포함합니다.
+ *
+ * 최적화 전략:
+ * 1. OpenMP를 사용한 병렬 처리: 가장 바깥쪽 루프(입력 배치 루프)를 병렬화합니다.
+ * 2. 루프 순서 변경: 캐시 효율성을 극대화하기 위해 (j, i) 루프를 (i, j) 순서로 변경.
+ * - Naive (j, i): A[i*M + j] -> Column-wise 접근 (캐시 미스율 높음)
+ * - Optimized (i, j): A[i*M + j] -> Row-wise 접근 (스트리밍, 캐시 효율 높음)
+ * 3. AVX2 SIMD 벡터화: 'AVX2 지원' 힌트를 활용, 256비트(float 8개) 단위로 연산. [cite: 473, 614]
+ * 4. FMA (Fused Multiply-Add): _mm256_fmadd_ps를 사용해 곱셈과 덧셈을 단일 명령어로 처리. 
+ * 5. Aligned Memory 활용: '64-byte aligned' 보장을 활용해 정렬된 load/store 사용. [cite: 442, 632]
+ * 6. Branchless ReLU: _mm256_max_ps를 사용해 'if'문 없는 ReLU 구현. [cite: 194]
+ */
+#include "fc_layer.h"
+#include <algorithm>   // std::max
+#include <omp.h>       // OpenMP 헤더 
+#include <immintrin.h> // AVX/AVX2/FMA 인트린직 헤더 [cite: 605]
 
 void fc_layer(
-    size_t data_cnt, 
-    size_t input_dim, 
-    size_t output_dim, 
-    float* matrix, 
-    float* bias, 
-    float* input, 
-    float* output, 
-    int threads
+    const float *X,  // 입력 피처 맵 (num_inputs * N)
+    const float *A,  // 가중치 행렬 (N * M)
+    const float *B,  // 편향 벡터 (M)
+    float *Y,        // 출력 피처 맵 (num_inputs * M)
+    int num_inputs,
+    int N,
+    int M,
+    int threads      // CLI에서 전달된 스레드 수
 ) {
-    // 스레드 수 검증 및 조정
-    if (threads < 1) threads = 1;
-    if ((size_t)threads > data_cnt) threads = data_cnt;
+    // 1. OpenMP 스레드 수 설정
+    // 과제에서 'threads' 인자를 전달하며, 이를 활용해 스레드를 생성해야 함 
+    omp_set_num_threads(threads);
+
+    // AVX2는 256비트 = 32바이트 = float 8개를 한 번에 처리 
+    const int VEC_WIDTH = 8;
     
-    // 단일 스레드 처리
-    if (threads == 1) {
-        ThreadData td;
-        td.data_cnt = data_cnt;
-        td.input_dim = input_dim;
-        td.output_dim = output_dim;
-        td.matrix = matrix;
-        td.bias = bias;
-        td.input = input;
-        td.output = output;
-        td.start_batch = 0;
-        td.end_batch = data_cnt;
-        td.thread_id = 0;
+    // ReLU(max(0, x)) 연산을 위한 0으로 채워진 AVX 벡터
+    const __m256 zero_vec = _mm256_setzero_ps(); // [cite: 628]
+
+    // 2. OpenMP를 사용해 가장 바깥쪽 루프 (배치 루프)를 병렬화
+    // 각 입력은 서로 독립적이므로 병렬화에 가장 적합
+    #pragma omp parallel for schedule(static)
+    for (int b = 0; b < num_inputs; ++b) {
         
-        fc_layer_thread(&td);
-        return;
+        // 현재 입력 및 출력에 대한 포인터
+        const float* current_X = X + b * N;
+        float* current_Y = Y + b * M;
+
+        // --- 1단계: Y 벡터를 Bias(B) 값으로 초기화 (Y = B) ---
+        // AVX2를 사용하여 8개씩 병렬 복사
+        for (int j = 0; j < M; j += VEC_WIDTH) {
+            // '64-byte aligned' 가 보장되므로 aligned load/store 사용 [cite: 442, 632]
+            __m256 b_vec = _mm256_load_ps(&B[j]);
+            _mm256_store_ps(&current_Y[j], b_vec);
+        }
+
+        // --- 2단계: 행렬-벡터 곱셈 (Y += X * A) ---
+        // 캐시 효율을 위해 (i, j) 루프 순서로 실행 (Y[j] += X[i] * A[i][j])
+        // A[i*M+j] 접근은 row-major  순서와 일치하여 캐시 친화적
+        for (int i = 0; i < N; ++i) {
+            // X[i] 값을 AVX 벡터의 8개 모든 레인에 복제 (broadcast)
+            // [x, x, x, x, x, x, x, x]
+            const __m256 x_vec = _mm256_set1_ps(current_X[i]);
+
+            // A의 i번째 행을 8개씩 벡터화하여 Y에 누적
+            for (int j = 0; j < M; j += VEC_WIDTH) {
+                // Y[j..j+7] 로드
+                __m256 y_vec = _mm256_load_ps(&current_Y[j]);
+                // A[i*M + j ... j+7] 로드
+                __m256 a_vec = _mm256_load_ps(&A[i * M + j]);
+
+                // Fused Multiply-Add: Y = (X * A) + Y
+                // y_vec = (x_vec * a_vec) + y_vec [cite: 612, 621, 647]
+                y_vec = _mm256_fmadd_ps(x_vec, a_vec, y_vec);
+
+                // 결과를 Y에 다시 저장
+                _mm256_store_ps(&current_Y[j], y_vec);
+            }
+        }
+
+        // --- 3단계: ReLU 활성화 함수 적용 (Y = max(0, Y)) ---
+        // if문(분기) 대신 _mm256_max_ps를 사용 (Branchless) [cite: 194, 645]
+        for (int j = 0; j < M; j += VEC_WIDTH) {
+            __m256 y_vec = _mm256_load_ps(&current_Y[j]);
+            // y_vec와 zero_vec 중 큰 값을 선택
+            y_vec = _mm256_max_ps(y_vec, zero_vec);
+            _mm256_store_ps(&current_Y[j], y_vec);
+        }
     }
-    
-    // 멀티스레드 처리 (배치 차원으로 분할)
-    pthread_t* thread_handles = (pthread_t*)malloc(threads * sizeof(pthread_t));
-    ThreadData* thread_data = (ThreadData*)malloc(threads * sizeof(ThreadData));
-    
-    // 배치를 스레드 수로 분할
-    size_t batch_per_thread = data_cnt / threads;
-    size_t remainder = data_cnt % threads;
-    
-    size_t current_start = 0;
-    
-    for (int t = 0; t < threads; t++) {
-        thread_data[t].data_cnt = data_cnt;
-        thread_data[t].input_dim = input_dim;
-        thread_data[t].output_dim = output_dim;
-        thread_data[t].matrix = matrix;
-        thread_data[t].bias = bias;
-        thread_data[t].input = input;
-        thread_data[t].output = output;
-        thread_data[t].start_batch = current_start;
-        thread_data[t].thread_id = t;
-        
-        // 나머지를 앞쪽 스레드에 분배
-        size_t current_chunk = batch_per_thread + (t < (int)remainder ? 1 : 0);
-        thread_data[t].end_batch = current_start + current_chunk;
-        current_start += current_chunk;
-        
-        pthread_create(&thread_handles[t], NULL, fc_layer_thread, &thread_data[t]);
-    }
-    
-    // 모든 스레드 완료 대기
-    for (int t = 0; t < threads; t++) {
-        pthread_join(thread_handles[t], NULL);
-    }
-    
-    free(thread_handles);
-    free(thread_data);
 }
