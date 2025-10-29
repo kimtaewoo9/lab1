@@ -1,0 +1,25 @@
+# 실행 파일
+nnfc
+*.out
+a.out
+
+# 컴파일 결과물
+*.o
+*.so
+*.a
+
+# 데이터 파일
+data/
+*.bin
+
+# macOS
+.DS_Store
+
+# 편집기
+*.swp
+*~
+.vscode/
+.idea/
+
+# 빌드 디렉토리
+build/
