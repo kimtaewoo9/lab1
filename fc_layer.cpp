@@ -23,28 +23,42 @@ void* fc_layer_thread(void* arg) {
     const size_t N = td->input_dim;
     const size_t M = td->output_dim;
     
-    // 각 입력 인스턴스 처리
     for (size_t b = 0; b < td->data_cnt; b++) {
         float* input_base = td->input + b * N;
         float* output_base = td->output + b * M;
         
-        // 이 스레드가 담당하는 출력 범위
         for (size_t m = td->start_idx; m < td->end_idx; m++) {
             
-            // Scalar version first (정확도 검증)
-            float sum = 0.0f;
+            __m256 sum_vec = _mm256_setzero_ps();
             
-            // 내적 계산
-            for (size_t n = 0; n < N; n++) {
-                float inv = input_base[n];
-                float weight = td->matrix[n * M + m];  // 원본 인덱싱 방식
-                sum += inv * weight;
+            size_t n;
+            for (n = 0; n + 7 < N; n += 8) {
+                __m256 input_vec = _mm256_loadu_ps(&input_base[n]);
+                
+                // 가중치도 연속된 메모리에서 로드
+                __m256 weight_vec = _mm256_set_ps(
+                    td->matrix[(n+7) * M + m],
+                    td->matrix[(n+6) * M + m],
+                    td->matrix[(n+5) * M + m],
+                    td->matrix[(n+4) * M + m],
+                    td->matrix[(n+3) * M + m],
+                    td->matrix[(n+2) * M + m],
+                    td->matrix[(n+1) * M + m],
+                    td->matrix[(n+0) * M + m]
+                );
+                
+                sum_vec = _mm256_fmadd_ps(input_vec, weight_vec, sum_vec);
             }
             
-            // Bias 추가
-            sum += td->bias[m];
+            float temp[8];
+            _mm256_storeu_ps(temp, sum_vec);
+            float sum = temp[0] + temp[1] + temp[2] + temp[3] + temp[4] + temp[5] + temp[6] + temp[7];
             
-            // ReLU
+            for (; n < N; n++) {
+                sum += input_base[n] * td->matrix[n * M + m];
+            }
+            
+            sum += td->bias[m];
             if (sum < 0.0f) sum = 0.0f;
             
             output_base[m] = sum;
